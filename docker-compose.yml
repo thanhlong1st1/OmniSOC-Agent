@@ -1,0 +1,77 @@
+# OmniSOC Agent — agentic SOC platform (Strands Agents)
+#   cp .env.example .env   # set secrets, Wazuh MCP URL/key and model provider
+#   docker compose up -d
+# Optional local inference: --profile ollama | --profile vllm (NVIDIA GPU) | --profile litellm
+# Demo with a simulated Wazuh fleet: docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d
+
+name: omnisoc-agent
+
+services:
+  autopilot:
+    build: .
+    image: omnisoc-agent:3.1.0
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://autopilot:${POSTGRES_PASSWORD:-}@postgres:5432/autopilot
+    ports:
+      - "${AUTOPILOT_BIND:-127.0.0.1}:${AUTOPILOT_PORT:-8480}:8080"
+    volumes:
+      - autopilot-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 2g}
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: autopilot
+      POSTGRES_USER: autopilot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autopilot -d autopilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # --- optional local inference --------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    profiles: [ollama]
+    restart: unless-stopped
+    volumes: [ollama-data:/root/.ollama]
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    profiles: [vllm]
+    restart: unless-stopped
+    command: ["--model", "${VLLM_MODEL:-Qwen/Qwen3-32B}", "--enable-auto-tool-choice", "--tool-call-parser", "hermes",
+              "--max-model-len", "32768"]
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    volumes: [hf-cache:/root/.cache/huggingface]
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    profiles: [litellm]
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    env_file: [.env]
+    volumes: [./litellm/config.yaml:/app/config.yaml:ro]
+
+volumes:
+  autopilot-data:
+  postgres-data:
+  ollama-data:
+  hf-cache:

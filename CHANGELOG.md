@@ -1,0 +1,448 @@
+# OmniSOC Agent — Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Fixed
+- **ToolCallGuard replaces ToolRetryLimiter** (`backend/app/swarm/factory.py`):
+  - **Bug #1 — Error retry loop:** Agents retried failing tool calls indefinitely, causing context window overflow (1M+ tokens). ToolCallGuard blocks after 3 consecutive errors per (agent, tool).
+  - **Bug #2 — Empty-result fishing loop:** Agents called the same tool 50+ times hoping for different results. ToolCallGuard blocks after 5 calls per tool per agent, with a 20 total calls budget per agent.
+  - **TypedDict bug:** `_key()` used `getattr()` on `tool_use` (a `TypedDict`/`dict`), always returning `""` — all tools shared one counter, making per-tool limits useless. Fixed to use `dict.get()`.
+  - Platform tools (skills, get_case, handoff_to_agent, etc.) are allowlisted to avoid false blocks.
+  - Thread-safe with `threading.Lock()` for concurrent agent execution.
+- **Agent detail page 500 Internal Server Error** (`backend/app/api/swarm.py`):
+  - `SELECT DISTINCT` on the `runs` table included JSON columns (`input`, `output_md`, `agents`, `handoffs`, `errors`). PostgreSQL has no equality operator for `json` type, causing `ProgrammingError: could not identify an equality operator for type json` on every agent detail page click.
+  - Fixed by replacing the `DISTINCT` on the full `Run` row with a subquery that gets distinct `run_id` from the `spans` table first, then fetches the corresponding `Run` rows.
+- **Prompt & Tools tab black screen** (`backend/app/api/swarm.py`):
+  - The `agent_prompt()` endpoint returned `skills_injected` as an array of objects (`{id, description}`), but the frontend renders each item directly as a React child (`<span>{skill}</span>`). React throws "Objects are not valid as a React child" which crashes the component, producing a blank/black screen.
+  - Fixed by returning `skills_injected` as a flat array of skill ID strings, matching the frontend's expected format.
+
+### Added
+- **Web Management Dashboard** (`manage/manage.html` → served at `/manage.html`):
+  - Full agent profile editing: name, Vietnamese name, codename, persona, description, responsibilities, icon, avatar color
+  - Per-agent model & API configuration: each agent can override the platform model with its own provider, model ID, API key, and base URL
+  - Skills assignment with checkbox UI
+  - Tools management: add/remove tools per agent
+  - Handoffs configuration: select which agents can receive handoffs
+  - Autonomy cap, temperature, max tokens configuration
+  - Additional instructions (appended to system prompt)
+  - All changes sync to the database via PATCH API
+- **Skills Library CRUD** (via dashboard):
+  - Create new skills with ID, name, description, category, and markdown body
+  - Edit existing skills (including built-in overrides)
+  - Full skill body editor with monospace markdown textarea
+- **Prompt Preview** (via dashboard):
+  - View composed system prompt for any agent
+  - See injected skills and tool specs
+- **Extended Agent PATCH API** (`backend/app/api/swarm.py`):
+  - New editable fields: name, name_vi, codename, persona, description, responsibilities, handoffs, icon, avatar_color, standards
+  - model_override now accepts api_key and base_url for per-agent model configuration
+- **HandoffSummarizer hook**: Compresses conversation context before agent-to-agent handoffs. Extracts findings, entities, severity, MITRE techniques, and recommended actions into a ~2-3K token summary (down from ~50K of raw tool output).
+- **Tier-specific system prompts**: L1/L2/L3/lead/specialist tiers each get role-appropriate operating rules (e.g. L1 cannot attempt containment, L3 uses propose_action for every state change).
+- **Tool/skill filtering per tier**: `TOOL_ALLOWLIST` and `SKILL_ALLOWLIST` restrict MCP tools and skills by agent tier. `SKILL_ROUTING` maps alert rule groups to relevant skills for dynamic injection.
+- **Alert-aware skill injection**: `get_relevant_skills()` intersects tier allowlist with alert-type routing to load only relevant skills per incident.
+- **Wibu Theme** (`manage/index.html`, `manage/assets/`):
+  - Third theme option alongside Light and Dark — anime-themed glassmorphism with Rem (Re:Zero) HD wallpaper as fixed background.
+  - Blue/purple color scheme with `backdrop-filter: blur()` on sidebar, header, cards, modals, and dialogs.
+  - Theme toggle patched from 2-column to 3-column grid (`manage/assets/index-Cqwmd4tH.js`).
+  - Theme persists in `localStorage` as `data-theme="wibu"`.
+- **Management Dashboard Glassmorphism** (`manage/manage.html`):
+  - Redesigned with anime-themed background and blue/purple frosted glass cards.
+  - Semi-transparent glass effect on topbar, sidebar, login box, inputs, buttons, and badges.
+
+## [3.0.0] - 2026-09-24
+
+OmniSOC Agent is now a Strands Agents platform. This is a breaking change: the Node Runtime Service and its installer are gone.
+
+### Changed
+- **Strands Agents core**: the platform previously under `strands/` is now the project root (`backend/`, `ui/`, `mock-wazuh/`, `Dockerfile`, `docker-compose.yml`). It's a 13-agent Strands swarm (Swarm/Graph workflows), a web console, RBAC, an autonomy policy, an approvals queue, MCP execution with `wazuh_check_*` verification and rollback, run tracing, evals, and Bedrock/Anthropic/OpenAI-compatible/vLLM/LiteLLM/Ollama providers. It talks to the Wazuh MCP Server directly.
+- **Strands is the only agent engine.** OpenClaw, Hermes and NemoClaw are no longer supported. An audit found that OpenClaw agents only reached Wazuh through two proxied endpoints (versus 41 MCP tools for the Strands agents), carried their own diverging 2,200-line prompt set instead of the verified skills, had two dormant agents and timer-driven heartbeats outside the policy engine, and passed tokens in URLs. The Hermes profile either got no Wazuh tools or unfiltered action tools. NemoClaw inherited the OpenClaw issues. Their profiles, the Runtime API compatibility layer and the setup-wizard runtime step were removed. Nemotron models remain available through the new **NVIDIA NIM** provider preset.
+- **IR playbooks are skills**: the 7 playbooks (brute force, lateral movement, privilege escalation, ransomware, suspicious PowerShell, data exfiltration, vulnerability spike) are now `ir-playbook-*` Agent Skills with the full playbook as `references/playbook.md`, carried by the IR lead, DFIR investigator and vulnerability manager (37 skills in total after the audit).
+- Ollama models default to a 32k context window (configurable).
+- CI runs pytest, the UI build, a mock-server smoke test and Docker builds with a Trivy scan.
+
+### Audit fixes (Wazuh accuracy and tool consistency)
+- **Rule IDs verified against the official Wazuh 4.14.8 ruleset.** The IR playbooks cited many rule IDs that exist but mean something else (e.g. rootcheck/CIS-CAT/Chrome-Remote-Desktop rules presented as Windows logon, exfiltration or WinRM detections), plus nonexistent ones; vulnerability-detector severities were inverted. All 37 skills now cite verified IDs and levels; behaviors without stock rules are marked as `custom rule 1000xx` sketches. `test_wazuh_skills.py` enforces this from `tests/fixtures/wazuh_rule_refs.json` (regenerated by `scripts/build_wazuh_rule_refs.py`).
+- **9 new Wazuh skills**: wazuh-mcp-querying (every agent), wazuh-rules-and-decoders, wazuh-fim-investigation, wazuh-sca-hardening, wazuh-malware-detection, wazuh-windows-sysmon, wazuh-cloud-container, wazuh-active-response, wazuh-platform-health. The 21 core skills were corrected (tool parameters, what `wazuh_check_*` actually inspects, permanent API blocks, compliance tags, ATT&CK mappings from the ruleset).
+- **New agent: Wazuh Platform Engineer** ("Keeper") owns the 9 manager/cluster/ingestion tools no agent used, and runs a 4-hourly platform-health workflow to catch detection blind spots (disconnected agents, dropped events, manager errors).
+- **Tool grants fixed.** Skills told agents to call tools they didn't have (e.g. the DFIR investigator lacked `get_wazuh_alerts`). Grants were widened where the job needs them, and tests require a skill's tools to be held by every agent carrying it. Four MCP *prompts* (`threat_hunt`, `security_investigation`, `compliance_audit`, `vulnerability_assessment`) were wrongly granted as tools and are removed.
+- **Action catalog** now states which actions need custom agent-side active-response scripts (`isolate_host`, `kill_process`, `quarantine_file`) and that API-triggered blocks are permanent until rolled back.
+- UI dependencies: react-router upgraded to v7 (fixes GHSA-wrjc-x8rr-h8h6 open redirect); `npm audit --omit=dev` is clean. UI package renamed to `omnisoc-agent-ui` 3.0.0.
+- Demo data uses official rule levels; the mock server's invented rules moved into the custom range. Credentials passed as `?token=` (SSE) are redacted from access logs. Built-in agents, workflows and eval suites now pick up new defaults on upgrade field by field, keeping admin customizations. Missing agent icons added.
+
+### Removed
+- `openclaw/`, `hermes/`, `nemoclaw/` agent profiles and their docs (HERMES_DEPLOYMENT, NEMOCLAW_DEPLOYMENT).
+- `runtime/autopilot-service` (Node Runtime Service, its Slack Socket Mode integration and its 594-test suite), `install/`, `scripts/`, `policies/` (replaced by the platform's policy engine and action catalog), legacy `agents/*.agent.yaml`, root-level `playbooks/` (now skills), and the docs specific to the Node runtime (Runtime API, evidence pack schema, CLI reference, Slack Socket Mode, heartbeats, observability export, policy and approvals, agent configuration/communication, scenarios, vLLM and air-gapped guides; the last two are folded into `docs/MODEL_PROVIDERS.md`).
+
+### Docs
+- New: QUICKSTART, DEPLOYMENT, ARCHITECTURE, AGENTS_AND_SKILLS, AUTONOMY_AND_APPROVALS, MODEL_PROVIDERS, MCP_INTEGRATION, TROUBLESHOOTING, API. TAILSCALE_MANDATORY, SECURITY and CONTRIBUTING are rewritten for the new architecture. Tests: 41 backend tests.
+
+## [1.x] - Node runtime changes (never tagged; superseded by 3.0.0)
+
+### Added
+- **Four new specialist agents (7 → 11 agents)**: the reactive pipeline is now complemented by proactive/specialist functions a mature SOC runs, each an industry-standard persona with its own `IDENTITY`/`AGENTS`/`TOOLS`/`MEMORY` files, config entries across all 4 profiles, webhook triggers, and roster entry:
+  - **Vulnerability Management** (`vuln-management`) — Vulnerability Management Analyst; risk-based CVE prioritization (CISA KEV → EPSS → CVSS + environmental → SSVC), NIST SP 800-40r4 SLAs, vulnerability-spike response (owns playbook PB-005). Webhook `vuln-spike`; 12h sweep.
+  - **Threat Intelligence** (`threat-intel`) — CTI Analyst; indicator enrichment with Admiralty source grading, MITRE ATT&CK + Diamond Model attribution, F3EAD cycle, Pyramid of Pain, IOC lifecycle → detection handoff. Webhook `ioc-enrichment`; reactive.
+  - **Threat Hunter** (`threat-hunter`) — proactive hypothesis-driven hunting (PEAK/TaHiTI, ATT&CK-aligned hunt catalog, baselining, coverage tracking, hunt→detection). Webhook `hunt-request`; 6h scheduled hunts.
+  - **Detection Engineer** (`detection-engineer`) — Detection-as-Code proposals (ADS framework, Sigma→Wazuh mapping, backtesting, FP tuning, ATT&CK coverage); closes the Reporting→rule-tuning loop. Webhook `detection-review`; reactive. Proposals are human-reviewed — never auto-deployed.
+  - **Runtime auto-dispatch** wires three specialists into the pipeline automatically (each gated by an env flag, default on, since each is an extra LLM run): `ioc-enrichment` fires when a case is triaged and carries an external indicator (public IP/domain/url/hash) — a side-dispatch that runs in parallel with correlation and writes enrichment back without changing pipeline status; `vuln-spike` fires when a vulnerability-detector/CVE alert is ingested; `detection-review` fires after a weekly report is stored. Flags: `AUTOPILOT_AUTO_ENRICH`, `AUTOPILOT_AUTO_VULN`, `AUTOPILOT_AUTO_DETECTION_REVIEW`. `hunt-request` stays schedule/manual (no natural pipeline trigger). New `caseHasExternalIndicators()` helper gates enrichment cost.
+  - Specialists are read-only and produce intelligence/proposals only; `_shared/SOUL.md` roster, ARCHITECTURE, README, AGENT_CONFIGURATION, and openclaw/README updated; `store-report` gains `vulnerability`/`threat_intel`/`hunt`/`detection` types; heartbeat cost doc updated (hunter 6h + vuln 12h add ~0.25 idle runs/h). Tests: 587 across 16 files.
+- **Hermes Agent runtime profile (`hermes/`)**: run the pipeline on Nous Research's self-improving [hermes-agent](https://github.com/NousResearch/hermes-agent) — `config.yaml.example` (model, Wazuh MCP bridge via `mcp-remote`, Docker terminal sandbox, guarded skills), `env.example`, and a runtime guide. Same Runtime API and two-tier approval workflow as OpenClaw.
+- **NemoClaw NVIDIA-stack profile (`nemoclaw/`)**: run the OpenClaw agents inside an [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw) OpenShell sandbox — `openclaw-nemoclaw.json` pinned to the NVIDIA stack only (Nemotron 3 Ultra/Super/Nano via build.nvidia.com, local NIM microservices, or Ollama-Nemotron), plus a deployment guide covering OpenShell policy tiers, `inference.local` routing, hardware (DGX Spark/Station, RTX PRO), and the related NVIDIA ecosystem (NeMo, NIM, Nemotron). NemoClaw deployments do not use third-party model providers.
+- **Security-expert personas for all 7 agents**: each `IDENTITY.md` now carries an explicit human SOC role — Tier 1 Analyst (triage), Tier 2 Analyst/Detection Engineer (correlation), Tier 3/DFIR Investigator (investigation), IR Lead (response-planner), Compliance Officer (policy-guard), Security Operations Engineer (responder), SOC Manager/Metrics Analyst (reporting) — with expertise and team handoffs; shared `SOUL.md` gains the team roster so agents operate as a human security ops team, and the README documents scaling the team into a swarm.
+- **Test coverage**: `openclaw-config.test.js` now validates `openclaw-vllm.json` (previously untested) and `nemoclaw/openclaw-nemoclaw.json`.
+- **New deployment guides**: `docs/HERMES_DEPLOYMENT.md` (install, config precedence, provider paths, MCP bridge, sandbox/skills security, troubleshooting) and `docs/NEMOCLAW_DEPLOYMENT.md` (prerequisites, install paths, all-NVIDIA inference options, policy tiers, sandbox config application, swarm scaling, ecosystem, troubleshooting); README, QUICKSTART, and AGENT_CONFIGURATION updated to reference the runtimes and personas.
+- **Cross-runtime coverage of the Issue #33 fixes**: documented and verified how the three fixes map to each runtime. The terminal-case-grouping and plan-expiry fixes live in the shared Runtime Service, so they apply automatically to **OpenClaw, Hermes, and NemoClaw** (all call the same Runtime API). Heartbeat idle cost is runtime-specific: **NemoClaw** uses the same OpenClaw agents on a *local GPU* (highest cost sensitivity) and now carries a dedicated "Heartbeat Cost on Local GPU" section plus a cost-aware config comment; **Hermes** is inherently event-driven with **zero idle inference** (no heartbeat), now stated explicitly. `HEARTBEATS_AND_COST.md` gains a per-runtime applicability table.
+- **New `docs/HEARTBEATS_AND_COST.md` + relaxed heartbeat defaults (Issue #33)**: documents that heartbeats run LLM inference on a timer even at zero alerts (the dominant idle cost on paid APIs and small local GPUs), the exact idle-inference math, OpenClaw's "only agents with a `heartbeat` block run heartbeats" rule (so only triage + correlation heartbeat), and three tunable profiles including a fully **event-driven** mode (`"0m"`) that leans on the runtime's zero-inference stalled-pipeline detector. Shipped defaults relaxed across all 4 configs: triage `10m→30m`, correlation `5m→30m` (idle inference ~18/h → ~4/h; `0m` for zero), with cost-aware inline comments; AGENT_CONFIGURATION and openclaw/README cadence tables corrected.
+- **New `docs/ARCHITECTURE.md`**: end-to-end system architecture — control/data/reasoning planes, the 7-agent pipeline and case lifecycle, two-tier approval and policy engine, active-response verification, the three pluggable runtimes, swarm scaling, deployment topologies, and security boundaries.
+- **README overhaul**: redesigned, professionally decorated header (tech + runtime badges, highlights strip, "Why Star This Project"), corrected stale counts (**582 tests** / ~6800 LOC — previously 548/6400), and a complete, categorized documentation index (all 19 docs, several were previously unlisted).
+- **Active-response execution verification (Issue #32)**: New opt-in `AUTOPILOT_VERIFY_ACTIONS` flag. When enabled, after a successful active-response dispatch the runtime calls the verification tool declared in `policies/toolmap.yaml` (`wazuh_check_blocked_ip`, `wazuh_check_agent_isolation`, `wazuh_check_process`, `wazuh_check_user_status`, `wazuh_check_file_quarantine`) and records `verified: true|false` plus a `verification` block on each action result. Best-effort: a `null` result (tool unavailable / unparseable) and a failed check are annotated with an explanatory `note` and never silently flip status. Addresses "API success does not prove on-host execution".
+- **`executive` (C-Level) and `incident` report types (Issue #30)**: `GET /api/agent-action/store-report` now accepts `type=executive` and `type=incident` alongside hourly/daily/weekly/monthly/shift.
+- **Documented env vars**: `.env.example` now documents previously-undocumented knobs — `AUTOPILOT_BOOTSTRAP_APPROVAL` (human-in-the-loop bypass), `TRUSTED_PROXY`, `AUTO_CLOSE_*`, `SLA_*`, stalled-pipeline and enrichment timeouts.
+- **docker-compose**: resource limits (`mem_limit`/`cpus`/`pids_limit`) and an explicit `AUTOPILOT_MODE` passthrough (set `=production` for fail-fast safety validation).
+
+### Changed
+- **Wazuh MCP Server compatibility updated to v4.3.0 (55 tools)**: README, ARCHITECTURE, MCP_INTEGRATION (tool reference now lists all 55 tools, including the 19 action tools), TROUBLESHOOTING, the Hermes/NemoClaw profiles, and `policies/toolmap.yaml` all reflect v4.3.0 — 36 query tools (Alerts, Agents, Vulnerabilities, Security Analysis, Compliance, System) plus 9 active-response, 5 verification, and 5 rollback tools. Supersedes the earlier v4.2.1 / 48-tool references.
+- **OpenClaw compatibility corrected to v2026.7.1+**: prior docs stated a minimum of "v2026.7.3", a version that was never published (npm `latest` is `2026.7.1-2` as of 2026-08-06; `2026.7.2` exists only as beta). README, TROUBLESHOOTING, and AIR_GAPPED_DEPLOYMENT now state **v2026.7.1+ (tested with v2026.7.1-2)**; the earlier "Tested with OpenClaw v2026.7.3" changelog entry should be read as the 2026.7.1 stable line.
+- **Project renamed to OmniSOC Agent**: the project is runtime-agnostic, renamed to "OmniSOC Agent" throughout docs, configs, and code (the npm package is now `omnisoc-agent`).
+- **KPI unit clarification (Issue #25)**: The reporting agent playbook now states explicitly that `GET /api/kpis` returns MTTx values in **seconds** (not minutes), with conversion guidance.
+- **Config consistency**: `firewall_drop`/`host_deny` added to the response-planner catalog and responder allowed-tools; policy-guard risk tiers/confidence/action-names aligned with `policy.yaml`; reporting-agent report types mapped to the runtime's accepted `store-report` types.
+- **Tests**: now **548 tests across 16 files, all passing** (added `audit-fixes.test.js` covering the CIDR matcher, protected-target deny-list, Slack context check, report-type path-traversal guard, and verification helper). `slack.test.js` no longer requires the optional `@slack/bolt` to be installed (lazy-loaded in `initSlack`).
+
+### Security
+- **Protected-target deny-list**: new `protected_targets` section in `policy.yaml` (IPs/CIDRs + agent IDs). `block_ip`/`firewall_drop`/`host_deny` are refused for deny-listed IPs and `isolate_host`/`restart_wazuh` for deny-listed agents — at plan creation and again at execution (defense-in-depth). Prevents an attacker-controlled alert field (e.g. spoofed `srcip`) from steering active-response at gateways/DNS/the manager. Defaults protect loopback and agent `000` (manager).
+- **Slack approvals now authorized**: `/wazuh approve|execute` and the approve/execute buttons now run `policyCheckApprover` (by Slack user ID) plus a workspace/channel allowlist check before approving or executing — previously anyone who could click the button could trigger real active-response. Placeholder-aware so dev/bootstrap is unaffected.
+- **Approval-token scaffolding documented as inactive**: clarified in code that the `generateApprovalToken`/`validateApprovalToken`/`consumeApprovalToken` helpers are not wired into the flow; authorization is enforced via approver-group membership + separation-of-duties.
+
+### Fixed
+- **New alerts no longer grouped into terminal Cases (Issue #33)**: `findRelatedCase()` skipped false-positive cases but never checked case *status*, so a new alert whose entities matched a recently closed/executed/rejected case (within the 1-hour grouping window) was merged into that terminal case — silently swallowing the new alert, "reopening" the case (bumping `updated_at`, appending evidence), and resetting the auto-close grace timer. Now cases in a terminal status (`closed`/`executed`/`rejected`/`false_positive`) are excluded from grouping (via a `terminal` flag on the entity index, set on status transition), with a defense-in-depth re-check at ingest so a stale/concurrent transition can't slip through. New `TERMINAL_CASE_STATUSES`, `markEntityCaseTerminal()`; tests added.
+- **Plan expiry now persisted by the background sweep (Issue #33)**: the periodic `plansCleanup` sweep set `state = EXPIRED` in memory but never wrote it to disk, so after a restart (plans reload from disk) an expired plan reverted to `proposed`/`approved` and could be acted on again. Expiry logic extracted to a testable `expireStalePlans()` that awaits `savePlanToDisk()`; regression test verifies the state survives a reload.
+- **Flaky/contaminated `enforces concurrent execution limit` test**: `execution.test.js` now busts the `require` cache before loading `index.js`, so `MAX_CONCURRENT_EXECUTIONS=2` (read once at module init) takes effect even when another test file loaded `index.js` first under the full-suite run; the mock MCP hold was also widened so the concurrency window no longer races under load. Full suite is deterministically green (**582 tests across 16 files**) across repeated runs.
+- **Placeholder validation no longer trips on YAML comments (Issue #33)**: startup policy validation now strips comments before scanning for `<PLACEHOLDER>` tokens, so guidance text like `# replace all <PLACEHOLDER> values` in `policy.yaml` no longer produces warnings — or blocks production startup — after all real values are configured. New `stripYamlComments` helper + tests; TROUBLESHOOTING gains a "Slack mention gets no reply" diagnostic checklist.
+- **Empty `actions` array now accepted on create-plan (Issue #31)**: `GET /api/agent-action/create-plan` no longer rejects `actions=[]` with HTTP 400. An empty plan is a valid outcome (false positive / lab test / human-only follow-up) and lets the case pipeline advance past `investigated` instead of stalling. Per-action policy/approval checks still apply when the array is non-empty.
+- **Failed executions no longer marked "executed"**: a plan whose actions all failed/denied/errored no longer advances the case to `executed` (which would auto-close it and corrupt MTTR/SLA). The case stays at its current status for retry/visibility; empty and partially-successful plans still advance.
+- **`/api/reports` path-traversal fixed**: the `type` query param is now whitelisted before use as a path segment (previously `type=../../x` could disclose arbitrary JSON file paths/contents).
+- **Most-recent plan resolution after restart**: plan lookup now selects by `created_at` instead of Map iteration order (which is filesystem order after a restart), so the correct plan_id is dispatched/executed.
+- **Toolmap verification & rollback tools now resolvable**: `resolveMcpTool()`/`isToolEnabled()` now also consult `verification_operations` and `rollback_operations`.
+- **`quarantine_file` glob warning (Issue #32)**: glob characters (`*`, `?`, `[]`) in a quarantine target are flagged at execution — Wazuh's quarantine AR and FIM verification need concrete paths.
+- **Install scripts**: `doctor.sh` no longer aborts on its first passing check (dropped `set -e` for the diagnostic; counters use `$((x+1))`); `uninstall.sh` no longer deletes `/etc/omnisoc-agent` (secrets) unless `--purge`; `install.sh` preserves an existing `.env` on re-install (regenerate with `REGENERATE_ENV=true`).
+- **Minor**: `search-alerts` `time_range=0h` no longer yields an unbounded query; `create-plan` `confidence` uses strict `Number()` parsing; removed dead `unblock_ip` validation branch.
+
+## [1.0.0] - 2026-03-26
+
+> **v1.0.0** is a clean semver reset marking the first production-ready release. All prior versions (2.0.0–2.4.3) were pre-release development iterations.
+
+### Highlights
+- **497 tests** across 14 files, all passing
+- **48 MCP tools** supported via Wazuh MCP Server v4.2.1
+- **7 SOC agents** with full playbooks and tool documentation
+- **End-to-end audit** — critical, high, and medium findings resolved
+- **Zero npm vulnerabilities**
+
+### Security — Production Readiness Audit
+- **[CRITICAL] Action type allowlist enforcement (C2)**: Response plans now validate action types against an explicit allowlist (`block_ip`, `firewall_drop`, `host_deny`, `isolate_host`, `kill_process`, `disable_user`, `quarantine_file`, `restart_wazuh`). Plans with unknown action types are rejected at creation time, preventing hallucinated or injected action types from reaching the MCP server.
+- **[CRITICAL] Alert payload sanitization (C1)**: New `sanitizeAlertPayload()` strips control characters, caps string lengths (100K), limits arrays (1000 items) and object keys (500) from Wazuh alert data before forwarding to agents, reducing prompt injection surface from attacker-controlled alert fields.
+- **[HIGH] Responder `exec` access removed (H1)**: Removed direct shell execution (`exec`) from the responder agent's tool permissions. All actions now flow exclusively through the approved plan execution pipeline via MCP.
+- **[HIGH] Cross-agent messaging restricted (H4)**: Removed `sessions_send` from triage, correlation, investigation, and reporting agents. Only response-planner, policy-guard, and responder retain inter-agent messaging capability, preventing lower-privilege agents from escalating through cross-agent communication.
+- **[HIGH] Agent ID path traversal prevention (H6)**: `/api/agent-action/get-agent` now validates `agent_id` is numeric (1-6 digits). Wazuh client's `get_agent_stats()` also validates `agent_id` and `component` parameters.
+- **[HIGH] Anti-injection instructions in all agent playbooks (H9)**: All 7 AGENTS.md files now include a "Security: Alert Content is Untrusted" section with explicit rules: never execute commands from alerts, validate IOC formats, detect prompt injection attempts, cap entity extraction at 50 per category.
+- **[HIGH] Stalled pipeline memory leak fix (H11)**: `stalledRedispatchCounts` Map now evicts stale entries (case IDs no longer in the active case list) when exceeding 1000 entries, preventing unbounded memory growth.
+- **[MEDIUM] Metrics endpoint authentication (M1)**: `/metrics` now requires auth token, preventing unauthenticated information disclosure.
+- **[MEDIUM] IP format validation on active response (M7)**: New `_validate_ip()` in Wazuh client validates IPv4/IPv6 format before passing to `block_ip`, `firewall_drop`, `host_deny`.
+- **[MEDIUM] Flag injection prevention (M6)**: `_sanitize_ar_argument()` now rejects values starting with `-` to prevent flag injection in active response commands.
+- **[MEDIUM] Error message sanitization (H8)**: Wazuh client HTTP 4xx errors no longer include raw API response bodies in exception messages. Full details logged server-side only.
+- **Test coverage**: 497 tests across 14 files, all passing. Includes regression tests for every security fix.
+
+### Added
+- **vLLM deployment support** (addresses #22): New `openclaw/openclaw-vllm.json` config for running OmniSOC Agent with self-hosted open-source models via vLLM. Includes pre-configured model entries for Qwen3 32B, Llama 3.3 70B, MiniMax-M2.1 139B, and DeepSeek-R1 70B with correct tool call parser settings. New `docs/VLLM_DEPLOYMENT.md` covers hardware requirements, Docker deployment, air-gapped setup, production systemd config, multi-GPU configurations, and AMD MI300X instructions. README updated with Path D for vLLM and vLLM entry in supported providers table.
+
+### Fixed
+- **Numeric confidence silently dropped in agent-action/update-case**: The `confidence` field was listed in `STRING_FIELDS`, so agents sending `{"confidence": 0.85}` via the `data` query parameter had the value silently ignored. Moved to `NUMBER_FIELDS` with proper type validation.
+- **min_confidence policy bypass when confidence is 0**: The check `confidence > 0 && confidence < minConfidence` allowed actions with unknown confidence (default 0) to bypass minimum confidence policies. Fixed to `minConfidence > 0 && confidence < minConfidence` — unknown confidence is now correctly denied when a threshold is configured.
+- **approve-plan accepts arbitrary decision values**: Any unrecognized `decision` parameter (e.g., typos like `alow` or `approv`) silently approved plans. Added validation against `["allow", "deny", "escalate"]` with 400 error for invalid values.
+- **Case status not synced on plan approval**: `approvePlan()` updated the plan state but never updated the associated case status to `approved`. This caused the stalled pipeline detector to see the case stuck in `planned` and keep re-dispatching. Now syncs case status on plan approval.
+- **Plans lost on service restart**: Response plans were stored only in an in-memory `Map()` with no disk persistence. Service restart (deploy, crash, OOM) permanently lost all pending/approved plans. Added `savePlanToDisk()` that persists plan state to `$AUTOPILOT_DATA_DIR/plans/` on every lifecycle change (create, approve, reject, execute, expire) and `loadPlansFromDisk()` that restores plans on startup.
+- **install.sh global tools.alsoAllow overly permissive**: The installer's generated config added `edit`, `write`, `exec` to the global tool policy, making per-agent `deny` lists weaker. Aligned with the reference `openclaw.json` which only grants `read`, `web_fetch`, and session tools globally, delegating elevated permissions to specific agents.
+
+### Previously fixed
+- **"Tool web_fetch not found" in sandboxed agents** (fixes #18): OpenClaw's sandbox has its own independent tool policy separate from the agent-level `tools.alsoAllow`. The sandbox default allow list does not include `web_fetch`, causing agents to get `"Tool web_fetch not found"` even though `web_fetch` is in their `tools.alsoAllow`. Fix: added `"tools": { "alsoAllow": ["web_fetch"] }` to the `agents.defaults.sandbox` config in `openclaw.json`, `openclaw-airgapped.json`, and the installer.
+- **"Missing Authorization header" on agent-action endpoints via web_fetch** (fixes #17, #18): OpenClaw's `web_fetch` tool only supports GET requests with no custom headers — agents cannot pass a `Bearer` token in the `Authorization` header. In production mode, the runtime requires auth even from localhost, so all agent API calls returned 401. Fix: `validateAuthorization()` now accepts auth token via `?token=<AUTOPILOT_MCP_AUTH>` query parameter on GET requests as a fallback when no `Authorization` header is present. All agent playbooks (AGENTS.md, TOOLS.md, HEARTBEAT.md) updated with `&token=<AUTOPILOT_MCP_AUTH>` on every API URL. Query param auth is limited to GET requests only to prevent token leakage in POST/PUT bodies. 7 new tests validate query param auth behavior.
+- **web_fetch SSRF guard blocks localhost — agents cannot reach runtime API** (related #16): Even after tools are correctly registered via `alsoAllow`, OpenClaw's SSRF guard blocks `web_fetch` requests to private/localhost IPs. There is no config-level override — `allowPrivateNetwork` is not in the zod schema and crashes the gateway. Workaround: deploy a reverse proxy (nginx/caddy) on a non-loopback address that forwards to `localhost:9090`, and update agent AGENTS.md/TOOLS.md URLs to use that proxy address. See TROUBLESHOOTING.md for details.
+- **Agents get `stopReason: "stop"` instead of `"tool_use"` — tools not registered in API request** (fixes #16): All OpenClaw config files used `tools.allow` to list tools like `web_fetch`, `read`, `edit` on top of `profile: "minimal"`. However, `allow` only *narrows* (filters down) the tools already in the resolved profile — it cannot add new ones. Since `web_fetch` has `profiles: []` (not in any named profile) and `minimal` only includes `session_status`, the `allow` list was silently ignored. The model received zero tool schemas, so it ended with `stopReason: "stop"` instead of making tool calls. Fix: changed `allow` to `alsoAllow` in all tool configuration blocks across `openclaw.json`, `openclaw-airgapped.json`, and `install/install.sh`. The `alsoAllow` key adds tools on top of the profile's base set, which is the correct OpenClaw semantics for extending a profile.
+- **Gateway URL with ws:// scheme causes connection failure** (fixes #15): `openclaw status --all` reports the gateway as `ws://127.0.0.1:18789` (its WebSocket endpoint for interactive sessions), but webhook dispatch requires HTTP. Users who copied the ws:// URL into `OPENCLAW_GATEWAY_URL` got silent fetch failures. Fix: runtime auto-normalizes `ws://` → `http://` and `wss://` → `https://` at startup with a warning log. New `normalizeGatewayUrl()` helper with 8 unit tests. Documentation updated (.env.example, env.template, TROUBLESHOOTING.md).
+- **Agent web_fetch instructions cause text output instead of tool invocation** (related #14, #15): All 6 agent AGENTS.md files showed `web_fetch` URLs inside markdown code blocks (`` ``` ``), which models interpreted as text examples and reproduced verbatim (`stopReason: "stop"` instead of `"tool_use"`). Rewrote all MANDATORY sections to use explicit `web_fetch(url="...")` invocation syntax with indented code (not fenced blocks) and added "Do NOT write the URL as text" guardrails. Affected: triage, correlation, investigation, response-planner, policy-guard, responder.
+- **OpenRouter tool calling failure — agents output web_fetch as text** (fixes #14): OpenClaw's `openai-completions` provider path (used by OpenRouter) only sends tool definitions if the model has `toolUse: true` in its capability catalog. Without this metadata, models write `web_fetch http://...` as plain text instead of invoking it as a tool call (`stopReason: "stop"` instead of `"tool_use"`). Root cause: upstream OpenClaw bug ([openclaw#1866](https://github.com/openclaw/openclaw/issues/1866), [openclaw#8923](https://github.com/openclaw/openclaw/issues/8923)). Fix: installer now runs `openclaw models scan` to refresh model capability metadata after config generation. Documentation updated with manual workaround (run `openclaw models scan`) and fallback (use direct Anthropic API as primary model for reliable tool calling). Note: this is an upstream OpenClaw issue — the SSRF/DNS-pinning changes are unrelated.
+- **OpenRouter not working out of the box**: OpenClaw requires `openrouter/` prefix on model names (e.g., `openrouter/anthropic/claude-sonnet-4-5`) to route through OpenRouter. Without the prefix, it tries the direct provider API with an empty key. The installer now offers OpenRouter as a provider choice and automatically rewrites model names. Documentation updated with clear instructions for manual setup.
+- **Pipeline stalls after triage — OpenClaw security envelope blocks tool calls** (fixes #13): OpenClaw wraps webhook payloads in `EXTERNAL_UNTRUSTED_CONTENT` which instructs models not to execute tools mentioned within untrusted content. Our `web_fetch` callback URLs were inside this envelope, so agents correctly refused to call them. Fix: added `allowUnsafeExternalContent: true` to all 6 hook mappings (safe — webhooks are loopback-only and token-authenticated), and restructured webhook messages to be data-only (callback URL templates now live in each agent's AGENTS.md system prompt instead of the webhook payload).
+
+### Added
+- **Model catalog refresh step**: Installer now runs `openclaw models scan` after config generation to populate tool calling metadata (`toolUse: true`) for configured models. This prevents the OpenRouter tool calling failure where agents output `web_fetch` as text. QUICKSTART.md updated with manual step (Step 5).
+- **Provider policy notice and OpenRouter recommendation**: README, QUICKSTART, and openclaw.json now warn users that Anthropic and Google have banned subscription OAuth tokens in third-party agent tools. OpenRouter is recommended as the safest single-key option. Direct provider API keys (pay-per-token) still work fine.
+- **Stalled-pipeline detector**: Automatically detects cases stuck in transient statuses (open, triaged, correlated, etc.) for longer than a configurable threshold and re-dispatches the webhook to give the agent another attempt. Configurable via `STALLED_PIPELINE_ENABLED`, `STALLED_PIPELINE_THRESHOLD_MINUTES` (default 30), and `STALLED_PIPELINE_CHECK_INTERVAL_MS` (default 300000). New metrics: `autopilot_stalled_pipeline_detected_total`, `autopilot_stalled_pipeline_redispatched_total`.
+- **Runtime enforcement for policy time_windows, rate_limits, and idempotency**: These three policy.yaml sections were previously declarative only. The runtime now enforces them:
+  - **Time windows**: `policyCheckTimeWindow()` blocks `createResponsePlan()` and `executePlan()` outside configured UTC day/time windows (respects `outside_window_action: allow|deny`)
+  - **Rate limits**: `policyCheckActionRateLimit()` enforces per-action and global hourly/daily rate limits inside the plan execution action loop. Counters auto-reset on window expiry.
+  - **Idempotency**: `policyCheckIdempotency()` blocks duplicate action+target pairs within the configured `window_minutes` (default 60min)
+  - Denied actions are skipped individually (rate limit / idempotency) or fail the entire plan (time window), with `policy_denies_total` metric incremented using reason labels `time_window_denied`, `action_rate_limited`, `global_rate_limited`, `duplicate_action`
+  - Cleanup intervals evict expired rate limit and dedup state every 5 minutes
+- **LLM deployment choice documentation**: README now presents three clear paths (Cloud APIs, Local Ollama, Hybrid) with the local/air-gapped path clearly stating current limitations
+- **Stalled pipeline redispatch backoff**: Re-dispatches are now capped at 5 attempts per case (resets on status transition), preventing gateway hammering on permanently stalled cases
+- **Data parameter schema validation**: `/api/agent-action/update-case` now validates field types (string, object, array) and enforces a 512 KB size limit on the `data` parameter
+- **Plan title/description length limits**: `create-plan` now rejects titles >500 chars and descriptions >10,000 chars
+- **listCases hard max**: `/api/cases` now clamps the `limit` parameter to 1-1000 range
+- **Enrichment cache eviction on overflow**: `enrichmentCache` now evicts oldest entry when hitting 10,000 entries
+- **Agent TOOLS.md stalled pipeline docs**: All 6 pipeline agent TOOLS.md files now document the `[RETRY]` message format and pre-built callback URLs
+- 497 tests across 14 files
+
+### Fixed
+- **Stalled pipeline data corruption**: `checkStalledPipeline()` now acquires the case lock before writing `updated_at`, preventing data loss from concurrent `updateCase` calls
+- **Stalled pipeline broken callback URLs**: Fixed callback URLs for `investigated` (was sending empty actions array, always rejected), `planned` and `approved` (were using literal `{plan_id}` instead of actual plan ID from evidence pack)
+- **Case lock race condition**: Replaced simple `Map.has/set/delete` pattern with proper async mutex queue. The old pattern allowed a third concurrent caller to bypass the lock between delete and resolve.
+- **Ollama "fetch failed" 5-minute timeout** (fixes #12, #13): OpenClaw bundles its own undici copy, and pi-ai's `http-proxy.ts` resets the global dispatcher with a default 300-second `headersTimeout`. Combined with OpenClaw silently disabling streaming for Ollama tool-calling models, any generation >5 min causes "fetch failed" with 0 tokens. The preload script now writes directly to the shared `globalThis[Symbol.for('undici.globalDispatcher.1')]` and re-applies via `setTimeout` to survive pi-ai's async overwrite. See `docs/AIR_GAPPED_DEPLOYMENT.md` for the complete fix.
+- **Ollama `api` mode in air-gapped config** (fixes #11): Changed `openclaw-airgapped.json` from `"api": "openai-completions"` with `/v1` to `"api": "ollama"` with native endpoint. The OpenAI-compatible mode breaks tool calling — models output raw JSON instead of invoking tools.
+- **`reasoning: false` for Ollama models** (fixes #10): Set `"reasoning": false` explicitly for standard Ollama models (Llama, Mistral, Qwen, CodeLlama). Only models with native thinking support (deepseek-r1, qwq) should have `"reasoning": true`.
+- **MCP session init timeout leak**: `clearTimeout` now runs in a `finally` block for the notification step, preventing timer leaks on error paths
+- **`dispatchToGateway` timeout and response leaks**: Timer is now cleared before retries and on error paths. Response body is drained on final 5xx to release connection pool sockets.
+- **`createCase` silent overwrite**: Now checks if `evidence-pack.json` already exists and returns 409 Conflict instead of silently overwriting
+- **False positive feedback on closed cases**: Feedback is now always appended; status change to `false_positive` is only attempted if the case isn't in a terminal state
+- **Slack `SAFE_ERROR_PATTERNS` missing entries**: Added patterns for "Executor must be different" (separation of duties) and "Case already exists"
+- **Log sensitive field denylist too narrow**: Expanded from 4 fields (auth, token, password, secret) to 10 fields (added api_key, apiKey, authorization, credential, bearer, session_token)
+- **`uncaughtException` handler**: Now sets `isShuttingDown = true` to reject new requests during the 1-second drain window
+- **Silent dispatch error suppression**: All 4 `.catch(() => {})` patterns on `dispatchToGateway` calls now log the error and increment `webhook_dispatch_failures_total`
+- **caseLocks unbounded growth**: Added `MAX_CASE_LOCKS` (10,000) cap with eviction of idle lock entries
+- **Inconsistent `Date.parse` usage**: Replaced with `new Date().getTime()` for consistency in approval token cleanup
+- **Installer `dmPolicy: "open"`**: Changed to `"allowlist"` in both `install.sh` and `openclaw.json`
+- **Installer `npm install --production`**: Changed to `npm ci --omit=dev` for deterministic builds
+- **Installer missing `AUTOPILOT_SERVICE_TOKEN`**: Now generated, stored, and substituted into env file
+- **Installer missing `OPENCLAW_WEBHOOK_TOKEN`/`AUTOPILOT_SERVICE_TOKEN` in `configure_system()`** (fixes #13): Local variable declarations in `configure_system()` omitted these two secrets, causing `_safe_subst()` to leave raw placeholders in the .env file — resulting in "Unauthorized" webhook errors
+- **Installer breaks when declining Slack** (fixes #13): `start_services()` returned exit code 1 under `set -e` when services failed, killing the entire install. Slack bindings were also left in `openclaw.json` even when Slack was disabled, potentially causing OpenClaw zod schema validation failures. Now: `start_services` is non-fatal, and Slack bindings are removed when Slack is declined.
+- **Installer `getent passwd` pipeline failure**: All 5 `getent passwd` calls now suppressed stderr and appended `|| true` to prevent `set -eo pipefail` from killing the script in LDAP/Docker environments where the user isn't in the local passwd database
+- **`dmPolicy: "open"` in `openclaw.json`**: Changed to `"allowlist"` to match the documented security posture
+- **`package.json` version**: Bumped from 2.3.0 to 2.4.3 to match the latest release
+- **RUNTIME_API.md wrong Slack env var names**: Changed `SLACK_CHANNEL_ALERTS`/`SLACK_CHANNEL_APPROVALS` to `SLACK_ALERTS_CHANNEL`/`SLACK_APPROVALS_CHANNEL` to match actual code
+- **RUNTIME_API.md `MCP_MAX_RETRIES` default**: Corrected from 3 to 2
+- **OBSERVABILITY_EXPORT.md dead metric**: Removed `autopilot_action_plans_proposed_total` (replaced by `plans_created_total` in v2.4.2)
+- **OBSERVABILITY_EXPORT.md phantom OpenTelemetry section**: Removed section describing OTEL support that was never implemented
+- **SECURITY.md supported versions**: Updated from 2.0.x-2.1.x to 2.2.x-2.4.x
+
+### Added — v1.0.0 Release Fixes
+- **Crash recovery for stuck EXECUTING plans**: `loadPlansFromDisk()` now resets plans stuck in EXECUTING state to FAILED on startup with a recovery message
+- **Bootstrap approval gate**: `policyCheckApprover()` now requires `AUTOPILOT_BOOTSTRAP_APPROVAL=true` when policy has placeholder Slack IDs, preventing autonomous agent auto-approval
+- **Alert dedup across midnight**: In-memory `alertDedup` Map with 1hr TTL ensures same alert retried across date boundary reuses original case ID
+- **Trusted proxy rate limiting**: Rate limiter only trusts `X-Forwarded-For` when `TRUSTED_PROXY=true` is set, preventing IP spoofing
+- **Entity index saturation warnings**: Logs warning at 90% capacity, error when full. New `autopilot_entity_index_size` gauge metric
+- **Plan memory cleanup**: Periodic eviction of terminal plans older than 24h. New `autopilot_plans_in_memory` gauge metric
+- **Wazuh MCP Server v4.2.1 compatibility**: Expanded toolmap from 3 to 9 action tools, added param validation for `kill_process` (requires `process_id`), `disable_user` (requires `username`), `quarantine_file` (requires `file_path`). Documented RBAC scope requirements and `AUTHLESS_ALLOW_WRITE`
+- **MCP isError detection**: `executePlan()` now checks `isError` flag in MCP response body, correctly marking actions as failed when MCP returns HTTP 200 with tool-level errors
+- **mcp_calls evidence recording**: Plan execution writes MCP tool call records to case evidence pack
+- **Duration clamping**: `buildMcpParams()` clamps duration to 86400s (24h) max to match Wazuh MCP Server limits
+- **LLM type coercion**: Runtime coerces string booleans (`"true"`/`"false"`), string numbers (`"0.9"`), and case-variant enums (`"Critical"`, `"Low"`) from local LLMs
+
+### Fixed — v1.0.0 Release Fixes
+- **Concurrent duplicate alerts return 500**: Wrapped check-then-create in `withCaseLock()` to eliminate TOCTOU race
+- **Malformed JSON returns 500**: `parseJsonBody()` errors now return proper 400/413/408 status codes
+- **Policy Guard confidence threshold mismatch**: Aligned playbook thresholds with policy.yaml (low=0.7, medium=0.7, high=0.8, critical=0.95)
+- **install.sh permission drift**: Removed extra `sessions_send` and `exec` permissions not in reference configs
+
+### Changed
+- **Tested with OpenClaw v2026.7.3**: Verified compatibility with the latest OpenClaw release. The undici timeout preload script is still required — pi-ai@0.55.3 ships identical `http-proxy.ts`.
+- **Wazuh MCP Server**: Updated compatibility from v4.0.6 to v4.2.1 (48 tools)
+- **Version reset**: Clean semver reset to 1.0.0 — all prior versions were pre-release development
+
+## [2.4.3] - 2026-02-27
+
+### Fixed
+- **`--skip-tailscale` set `AUTOPILOT_MODE=production`**: The `--skip-tailscale` flag didn't change `INSTALL_MODE` from `"full"`, so the generated `.env` always got `AUTOPILOT_MODE=production`. Production mode rejects Slack placeholder values in `policy.yaml`, causing the runtime to fail on startup with `"Production mode cannot use placeholder values in policy"`. Now `--skip-tailscale` implies bootstrap mode unless `--mode full` is explicitly passed.
+- **Missing `gateway.mode=local`**: OpenClaw v2026.2.17 requires `gateway.mode` to be set — without it the gateway refuses to start with `"Gateway start blocked: set gateway.mode=local"`. Added `"mode": "local"` to both reference configs (`openclaw.json`, `openclaw-airgapped.json`) and the installer-generated config. Corrected previous advice in issue #1 that incorrectly recommended removing this key.
+
+## [2.4.2] - 2026-02-27
+
+### Fixed
+- **Global `tools.allow` missing `web_fetch` and `sessions_send`**: Added both to the global `tools.allow` list in `openclaw.json`, `openclaw-airgapped.json`, and the installer. Agent-level allow lists cannot override the global policy — if `web_fetch` was missing from the global list, agents silently could not make HTTP requests, causing the pipeline to stall after triage with no error.
+- **JWT exchange race condition**: Concurrent callers of `getMcpAuthToken()` received the raw Promise object instead of the resolved token string, causing `[object Promise]` to be sent as the Bearer token. Added `await` to the dedup return path.
+- **MCP session init race condition**: Added dedup guard (`mcpSessionInitPromise`) to `ensureMcpSession()` to prevent concurrent callers from racing to initialize the MCP session. Uses the same pattern as the JWT exchange dedup.
+- **X-Forwarded-For IP extraction**: Changed from `.pop()` (last/proxy IP) to `[0]` (first/client IP) in both auth validation and rate limiting. The previous behavior allowed attackers to spoof their IP by adding an X-Forwarded-For header, bypassing rate limiting and auth lockout.
+- **Localhost bootstrap scope**: Changed `scope: "read"` to `scope: "write"` for localhost requests in bootstrap mode, matching the documented and actual behavior (write endpoints only checked `authResult.valid`, not scope).
+- **`createCase()` race condition**: Wrapped in `withCaseLock()` to prevent concurrent create+update on the same case ID from causing lost updates.
+- **HTTP 401 for scope-insufficient tokens**: Service tokens with read-only scope hitting write endpoints now correctly return 403 Forbidden instead of 401 Unauthorized.
+- **MCP RPC error double-counts metrics**: JSON-RPC errors from successful HTTP responses no longer count as both "success" and "error" in Prometheus metrics.
+- **Plan stuck in EXECUTING state**: Plans that encounter an unexpected throw during execution are now marked as FAILED in the `finally` block instead of remaining in EXECUTING state permanently.
+- **`listPlans()` stale expiry state**: Now calls `getPlan()` per entry to trigger expiry checks, ensuring expired plans are correctly reflected in list responses.
+- **Dead metric `action_plans_proposed_total`**: Removed unused metric that was always 0 (replaced by `plans_created_total`).
+- **Installer `AUTOPILOT_MODE=bootstrap` hardcoded**: The `.env` template always set bootstrap mode regardless of install mode. Now uses a placeholder substituted based on `$INSTALL_MODE` (full → production, bootstrap/mcp-only → bootstrap).
+- **Installer `mcp-only` mode crash**: `start_services()` unconditionally tried to start `omnisoc-agent.service` which doesn't exist in mcp-only mode. Now guarded.
+- **Installer missing `apt-get update`**: Added package index refresh after adding the nodesource repository, fixing Node.js install failures on Debian/Ubuntu when other dependencies were already present.
+- **Installer runtime `ReadWritePaths`**: Added `$RUNTIME_DST` to the systemd service `ReadWritePaths` under `ProtectSystem=strict` so Node.js can write to its working directory.
+- **Installer `check_root` ordering**: Moved root check before interactive prompts so non-root users aren't forced through the consent flow before being told they need root.
+- **Installer hook mappings**: Added `"path": "/webhook"`, `messageTemplate`, and `name` to all 6 hook mappings; changed absolute paths to relative.
+- **Installer agent tool permissions**: Moved `edit` from deny to allow lists for triage, correlation, investigation, and policy-guard agents to match reference templates.
+- **Installer missing env vars**: Added `OPENCLAW_GATEWAY_URL` and `AUTOPILOT_RUNTIME_URL` to the generated `openclaw.json` env section.
+- **Slack slash command error leak**: Replaced raw `err.message` with `safeErrorMessage()` in approve/execute/reject catch blocks to prevent internal details from being exposed in Slack.
+- **Slack `safeErrorMessage` pattern mismatch**: The pattern `/^Tier 1 required/` did not match the actual error `"Plan must be approved before execution (Tier 1 required)"`. Added matching pattern.
+- **Slack `formatPlansMessage` unescaped**: Added `escapeMrkdwn()` to plan title and risk level in the plans list message.
+- **Slack `postCaseAlert` NaN timestamp**: Added `isNaN` guard with fallback text when `created_at` is invalid or missing.
+
+## [2.4.1] - 2026-02-27
+
+### Fixed
+- **OpenClaw tool name format**: Changed `web.fetch` to `web_fetch` in all agent `tools.allow` lists. OpenClaw uses snake_case identifiers (`web_fetch`) in per-agent allow/deny lists — dot notation (`web.fetch`) is only valid for global config paths (e.g., `tools.web.fetch.enabled`). The incorrect format caused OpenClaw to log "unknown entries (web.fetch)" warnings and agents could not make HTTP requests.
+- **Correlation agent missing `web_fetch`**: Added `web_fetch` to the correlation agent's allow list in `openclaw.json` (was present in air-gapped config but missing from reference template).
+- **Installer global `web_fetch` disabled**: Changed `"fetch": {"enabled": false}` to `{"enabled": true}` in the installer-generated `openclaw.json`. Without this, the `web_fetch` tool was globally disabled even when listed in agent allow lists.
+
+## [2.4.0] - 2026-02-26
+
+### Fixed
+- **OpenClaw webhook 400 error**: Added required `messageTemplate` and `name` fields to all 6 hook mappings in both `openclaw.json` and `openclaw-airgapped.json`. Without `messageTemplate`, the OpenClaw Gateway could not extract the message body from incoming webhook POSTs, returning `400 "hook mapping requires message"`.
+- **OpenClaw webhook 401 error**: Separated `OPENCLAW_WEBHOOK_TOKEN` from `OPENCLAW_TOKEN`. OpenClaw requires a dedicated hook token for webhook endpoint validation, distinct from the gateway auth token. The runtime now uses `OPENCLAW_WEBHOOK_TOKEN` for webhook dispatch (falls back to `OPENCLAW_TOKEN` for backwards compatibility).
+- **MCP JWT cache race condition**: Added promise-based deduplication to `getMcpAuthToken()` to prevent thundering herd when JWT cache expires. Multiple concurrent callers now share a single in-flight JWT exchange instead of triggering parallel requests.
+
+### Added
+- **Separate webhook token**: `OPENCLAW_WEBHOOK_TOKEN` environment variable for dedicated webhook endpoint authentication. Generated automatically by the installer and stored in `/etc/omnisoc-agent/secrets/openclaw_webhook_token`.
+- **Installer `--mode` flag**: `install.sh` now supports `--mode full|bootstrap|mcp-only`. `bootstrap` skips Tailscale (equivalent to `--skip-tailscale`). `mcp-only` installs only the MCP Server, skipping OpenClaw Gateway, Runtime Service, and Agent deployment.
+- **Webhook dispatch diagnostic logging**: On 400 errors from OpenClaw Gateway, the runtime now logs payload keys, `message` field presence, and a message preview to aid troubleshooting.
+- 27 new tests (255 total): Webhook payload shape validation, JWT deduplication under concurrency, and getMcpAuthToken edge cases.
+
+### Changed
+- `dispatchToGateway()` now uses `OPENCLAW_WEBHOOK_TOKEN` (with `OPENCLAW_TOKEN` fallback) instead of `OPENCLAW_TOKEN` directly
+- `dispatchToGateway()` now logs detailed diagnostic info (payload keys, message presence, response body preview) on 4xx errors instead of just the status code
+- `hooks.token` in both OpenClaw configs changed from `${OPENCLAW_TOKEN}` to `${OPENCLAW_WEBHOOK_TOKEN}`
+
+## [2.3.0] - 2026-02-22
+
+### Added
+- **MCP JSON-RPC protocol**: `callMcpTool()` now supports the standard MCP JSON-RPC 2.0 protocol (`POST /mcp` with `tools/call` method) in addition to legacy REST mode. Configurable via `MCP_AUTH_MODE`.
+- **JWT auth exchange**: Automatic API key → JWT exchange via `/auth/token` with in-memory caching and 401 retry logic
+- **IP enrichment**: AbuseIPDB v2 integration enriches public IP entities during alert ingestion. TTL-based cache (10K max entries), configurable timeout. Enabled via `ENRICHMENT_ENABLED=true`.
+- **Entity-based alert grouping**: Alerts sharing entities (IPs, users, hosts) within a configurable time window are automatically grouped into existing cases instead of creating duplicates
+- **False positive feedback endpoint**: `POST /api/cases/:id/feedback` accepts analyst verdicts (`true_positive`, `false_positive`, `needs_review`). False positive verdicts mark entities in the grouping index to prevent future re-grouping.
+- **Alert ID normalization**: Raw Wazuh alerts using `id` or `_id` fields are normalized to `alert_id` for consistent downstream handling
+- **Wazuh integrator improvements**: `--max-time 10` for curl, `${RUNTIME_PORT}` env var, configurable alert level threshold via `WAZUH_ALERT_LEVEL`
+- **New Prometheus metrics**: `enrichment_requests_total`, `enrichment_cache_hits_total`, `enrichment_errors_total`, `false_positives_total`, `feedback_submitted_total{verdict}`
+- **Cleanup intervals**: Automatic expiry of stale entity index entries and enrichment cache entries
+- 32 new tests (228 total): E2E pipeline test, feedback endpoint tests, enrichment unit tests, alert grouping tests, MCP auth tests
+- New `.env.example` variables: `MCP_AUTH_MODE`, `ENRICHMENT_ENABLED`, `ABUSEIPDB_API_KEY`, `ALERT_GROUP_ENABLED`, `WAZUH_ALERT_LEVEL`, cache TTLs
+
+### Changed
+- `callMcpTool()` defaults to `mcp-jsonrpc` mode (JSON-RPC 2.0 at `/mcp` endpoint); set `MCP_AUTH_MODE=legacy-rest` for backwards compatibility
+- Alert ingestion response now includes `grouped_into` field when an alert is grouped into an existing case
+- `updateCase()` supports `feedback` array field for persisting analyst verdicts
+
+## [2.2.0] - 2026-02-22
+
+### Added
+- **Autonomous agent pipeline**: Webhook dispatch wires agents end-to-end — runtime triggers downstream agents via OpenClaw Gateway on status changes
+- **Gateway dispatch**: Fire-and-forget `dispatchToGateway()` with 10s timeout, 1 retry, and Prometheus metrics (`webhook_dispatches_total`, `webhook_dispatch_failures_total`)
+- **Status-driven handoffs**: Case status changes automatically trigger the next agent (triaged → correlation, correlated → investigation, investigated → response-planner)
+- **Inline policy enforcement**: Three enforcement points enforce `policy.yaml` at runtime:
+  - **Plan creation**: Validates each action against allowlist, checks `enabled` and `min_confidence`
+  - **Plan approval**: Validates approver against groups, checks `can_approve` and `max_risk_level`
+  - **Plan execution**: Validates evidence count against `min_evidence_items`
+- **7 action tools enabled** in `toolmap.yaml`: `block_ip`, `isolate_host`, `kill_process`, `disable_user`, `quarantine_file`, `firewall_drop`, `host_deny`
+- **Agent Runtime API access**: All 6 agent TOOLS.md files updated with HTTP endpoint documentation
+- 16 new tests for gateway dispatch and policy enforcement (196 total)
+- `OPENCLAW_GATEWAY_URL` and `OPENCLAW_TOKEN` environment variables for gateway integration
+
+### Changed
+- **Policy Guard role**: Primary enforcement is now inline at the runtime level; the Policy Guard agent provides supplementary LLM-based analysis
+- `web_fetch` enabled in both `openclaw.json` and `openclaw-airgapped.json` so agents can call the runtime API
+- Bootstrap mode: Policy enforcement is fail-open (warns but allows) for easier testing
+- Production mode: Policy enforcement is fail-closed (denies if policy cannot be loaded)
+
+### Fixed
+- **YAML parser bug**: `parseSimpleYaml` silently skipped indented list items (standard YAML style) — now correctly parses `items:\n  - first\n  - second`
+- Policy configuration loaded at startup but never enforced at runtime
+
+## [2.1.0] - 2026-02-17
+
+### Added
+- **Multi-provider LLM support**: Claude, OpenAI, Groq, Mistral, xAI, Google, Ollama, OpenRouter, Together, Cerebras
+- **Centralized port configuration**: All service ports (Gateway, MCP, Runtime) configurable via environment variables
+- **Pre-flight configuration validator**: Interactive validation in installer checks required settings before starting services
+- **Full-stack health check script** (`scripts/health-check.sh`): Verifies Runtime, MCP, OpenClaw, Wazuh, Slack, permissions, services, disk space
+- **Production-ready Dockerfile** with multi-stage build and configurable runtime port
+- **Docker Compose** configuration for container deployment
+- **GitHub Actions CI/CD pipeline** (lint, test, security audit, build)
+- ESLint configuration for code quality
+
+### Changed
+- **Playbooks upgraded to v2.0**: All 7 incident response playbooks rewritten with TLP markings, expanded MITRE ATT&CK sub-techniques, OS-specific forensic artifacts, chain of custody requirements, regulatory compliance mappings (NIST, ISO, SANS), communication templates, and agent pipeline integration
+- **Policy configuration**: Slack integration marked as optional with `slack_required: false`; API-based approval works without Slack
+- **Installer**: Added `validate_configuration()` step with interactive prompts; Slack remains optional and deferrable
+- Ports no longer hardcoded across files; `install/env.template` is the single source of truth
+- Agent prompts note configurable runtime port (default 9090)
+- Wazuh integrator in installer uses configured port variables instead of hardcoded values
+
+### Security
+- Gateway binds to localhost only (127.0.0.1:18789)
+- MCP Server binds to Tailscale IP only
+- Runtime Service binds to localhost only
+- Docker container: read-only root filesystem, all capabilities dropped, no privilege escalation
+- Pairing mode for device authorization
+- Credential isolation with 600/700 permissions
+
+## [2.0.0] - 2025-11-20
+
+### Added
+- **Two-tier approval workflow** for response plans (Approve → Execute)
+- Response Plans API with full state management
+  - `POST /api/plans` - Create response plan
+  - `POST /api/plans/:id/approve` - Tier 1 approval
+  - `POST /api/plans/:id/execute` - Tier 2 execution
+  - `POST /api/plans/:id/reject` - Reject plan
+- **Slack Socket Mode integration** for secure communication
+  - Interactive buttons for plan approval/execution
+  - Slash commands (`/wazuh status`, `/wazuh approve`, etc.)
+  - Real-time case and plan notifications
+- **Responder capability toggle** (`AUTOPILOT_RESPONDER_ENABLED`)
+  - Disabled by default for safety
+  - Human approval always required even when enabled
+- Automated alert triage with entity extraction
+- MITRE ATT&CK mapping extraction from Wazuh alerts
+- Comprehensive security policies with approver groups
+- Rate limiting and request body size limits
+- Graceful shutdown handling with cleanup
+- Memory management with automatic cleanup intervals
+
+### Changed
+- Service version bumped to 2.0.0
+- Enhanced health endpoint with responder status
+- Improved logging with JSON format support
+- Security headers on all HTTP responses
+
+### Security
+- Input validation for all API endpoints
+- Authorization validation for sensitive operations
+- Timing-safe token comparison
+- Auth failure lockout (5 attempts, 30-minute lockout)
+
+## [1.0.0] - 2025-09-15
+
+### Added
+- Initial release
+- Evidence pack management
+- Case creation and updates
+- Approval token management
+- Prometheus metrics endpoint
+- MCP client wrapper with toolmap resolution
+- 7 SOC automation agents:
+  - Triage Agent
+  - Correlation Agent
+  - Investigation Agent
+  - Response Planner Agent
+  - Policy Guard Agent
+  - Responder Agent
+  - Reporting Agent
+
+[Unreleased]: https://github.com/thanhlong1st1/OmniSOC-Agent/compare/v2.4.3...HEAD
+[2.4.3]: https://github.com/thanhlong1st1/OmniSOC-Agent/compare/v2.4.2...v2.4.3
+[2.4.2]: https://github.com/thanhlong1st1/OmniSOC-Agent/compare/v2.4.0...v2.4.2
+[2.4.0]: https://github.com/thanhlong1st1/OmniSOC-Agent/compare/v2.3.0...v2.4.0
+[2.3.0]: https://github.com/thanhlong1st1/OmniSOC-Agent/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/thanhlong1st1/OmniSOC-Agent/compare/v2.1.0...v2.2.0
+[2.1.0]: https://github.com/thanhlong1st1/OmniSOC-Agent/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/thanhlong1st1/OmniSOC-Agent/compare/v1.0.0...v2.0.0
+[1.0.0]: https://github.com/thanhlong1st1/OmniSOC-Agent/releases/tag/v1.0.0
